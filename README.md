@@ -10,10 +10,13 @@
 
 2. Установите Docker Compose: [Инструкция для Docker Compose](https://docs.docker.com/compose/install/)
 3. Установить при создании приложения в Visual Studio
-dotnet add package Telegram.Bot --version 18.0.0
-dotnet add package Newtonsoft.Json --version 13.0.3
-dotnet add package Microsoft.Data.SqlClient --version 5.1.0
-dotnet add package System.Net.Http --version 4.3.4
+dotnet add package Telegram.Bot --version 18.0.0||
+
+dotnet add package Newtonsoft.Json --version 13.0.3||
+
+dotnet add package Microsoft.Data.SqlClient --version 5.1.0||
+
+dotnet add package System.Net.Http --version 4.3.4||
 
 #### Шаги развертывания
 
