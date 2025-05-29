@@ -1,0 +1,31 @@
+version: '3.8'
+
+services:
+  bot:
+    build: .
+    environment:
+      - BOT_TOKEN=7161824860:AAHXWqRszRhT5Z4Ti5Eu2vuGC40XLAsQ1mI
+      - DB_CONNECTION=Server=DESKTOP-2A9H5QL;Database=Telegramm Test Task;Integrated Security=True;
+    depends_on:
+      - db
+    networks:
+      - bot-network
+
+  db:
+    image: mcr.microsoft.com/mssql/server:2019-latest
+    environment:
+      SA_PASSWORD: YourStrong@Passw0rd
+      ACCEPT_EULA: Y
+    volumes:
+      - db-data:/var/opt/mssql
+      - ./scripts:/docker-entrypoint-initdb.d
+    networks:
+      - bot-network
+    ports:
+      - "1433:1433"
+
+networks:
+  bot-network:
+
+volumes:
+  db-data:
