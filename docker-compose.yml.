@@ -5,9 +5,10 @@ services:
     build: .
     environment:
       - BOT_TOKEN=7161824860:AAHXWqRszRhT5Z4Ti5Eu2vuGC40XLAsQ1mI
-      - DB_CONNECTION=Server=DESKTOP-2A9H5QL;Database=Telegramm Test Task;Integrated Security=True;
+      - DB_CONNECTION=Server=db;Database=Telegramm Test Task;User Id=sa;Password=YourStrong@Passw0rd;
     depends_on:
-      - db
+      db:
+        condition: service_healthy
     networks:
       - bot-network
 
@@ -23,6 +24,12 @@ services:
       - bot-network
     ports:
       - "1433:1433"
+    healthcheck:
+      test: /opt/mssql-tools/bin/sqlcmd -U sa -P YourStrong@Passw0rd -Q "SELECT 1" -b -o /dev/null
+      interval: 10s
+      retries: 10
+      start_period: 10s
+      timeout: 3s
 
 networks:
   bot-network:
