@@ -1,0 +1,1305 @@
+Code From C# Работу выполнил Чеботарев А.Ю.
+Цель работы создание телеграмм бота для курсов волют 
+мною были добавлены фичи 
+1- Возможность отслежования курса тоетсь вы просите бота сообщить вам когда Usd будет 80 рублей по наступлению этого момента вам прийдет уведомление 
+2- Возможность отслеживания графика валют в текстовом формате тоесть при вводе команды /usd или /eur вам выпадут мини графики 
+
+
+using System;
+using System.Collections.Generic;
+using System.Data;
+using System.Data.SqlClient;
+using System.IO;
+using System.Linq;
+using System.Net.Http;
+using System.Text;
+using System.Threading;
+using System.Threading.Tasks;
+using Newtonsoft.Json;
+using Telegram.Bot;
+using Telegram.Bot.Exceptions;
+using Telegram.Bot.Polling;
+using Telegram.Bot.Types;
+using Telegram.Bot.Types.Enums;
+using Telegram.Bot.Types.ReplyMarkups;
+using System.Globalization;
+
+public class CurrencyBot : IUpdateHandler
+{
+    private readonly ITelegramBotClient _botClient;
+    private readonly HttpClient _httpClient = new HttpClient();
+    private readonly Timer _notificationTimer;
+    private readonly Timer _alertCheckTimer;
+    private readonly string _connectionString;
+
+    // Админская часть
+    private readonly HashSet<long> _authorizedAdmins = new HashSet<long>();
+    private AdminState _adminState = AdminState.None;
+    private readonly Dictionary<long, ExportParams> _exportSessions = new Dictionary<long, ExportParams>();
+
+    // Состояния для алертов
+    private enum AlertState
+    {
+        None,
+        WaitingForCurrency,
+        WaitingForCondition,
+        WaitingForTargetValue
+    }
+    private readonly Dictionary<long, AlertState> _alertStates = new Dictionary<long, AlertState>();
+    private readonly Dictionary<long, Alert> _alertSessions = new Dictionary<long, Alert>();
+
+    // Кэш для истории курсов
+    private readonly Dictionary<string, List<CurrencyRateHistory>> _currencyHistory = new Dictionary<string, List<CurrencyRateHistory>>();
+    private const int HISTORY_LENGTH = 24; // Храним историю за 24 часа
+
+    public CurrencyBot(string botToken, string connectionString)
+    {
+        _botClient = new TelegramBotClient(botToken);
+        _connectionString = connectionString;
+
+        // Таймер для ежедневных уведомлений
+        _notificationTimer = new Timer(SendDailyNotifications, null,
+            CalculateDelayToNextCheck(),
+            TimeSpan.FromHours(24));
+
+        // Таймер для проверки алертов (каждые 5 минут)
+        _alertCheckTimer = new Timer(CheckAlerts, null, TimeSpan.Zero, TimeSpan.FromMinutes(5));
+    }
+
+    private TimeSpan CalculateDelayToNextCheck()
+    {
+        var now = DateTime.Now;
+        var targetTime = new DateTime(now.Year, now.Month, now.Day, 10, 0, 0);
+        return now < targetTime ? targetTime - now : targetTime.AddDays(1) - now;
+    }
+
+    public async Task RunBotAsync()
+    {
+        var receiverOptions = new ReceiverOptions();
+        _botClient.StartReceiving(
+            updateHandler: this,
+            receiverOptions: receiverOptions,
+            cancellationToken: CancellationToken.None
+        );
+
+        var me = await _botClient.GetMeAsync();
+        Console.WriteLine($"Бот @{me.Username} запущен!");
+        await Task.Delay(-1);
+    }
+
+    private async void SendDailyNotifications(object state)
+    {
+        try
+        {
+            using (var connection = new SqlConnection(_connectionString))
+            {
+                await connection.OpenAsync();
+                var query = "SELECT TelegramUserId, CurrencySub FROM Subscribers";
+                using (var cmd = new SqlCommand(query, connection))
+                using (var reader = await cmd.ExecuteReaderAsync())
+                {
+                    while (await reader.ReadAsync())
+                    {
+                        long userId = reader.GetInt64(0);
+                        string currency = reader.GetString(1);
+
+                        try
+                        {
+                            decimal? rate = await GetCurrencyRate(currency);
+                            if (rate.HasValue)
+                            {
+                                await _botClient.SendTextMessageAsync(
+                                    userId,
+                                    $"🏦 Ежедневный курс {currency}: {rate.Value:F2} RUB"
+                                );
+                            }
+                        }
+                        catch (Exception ex)
+                        {
+                            Console.WriteLine($"Ошибка рассылки для {userId}: {ex.Message}");
+                        }
+                    }
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Ошибка при рассылке: {ex.Message}");
+        }
+    }
+
+    // ===================== ПРОВЕРКА АЛЕРТОВ =====================
+    private async void CheckAlerts(object state)
+    {
+        try
+        {
+            using (var connection = new SqlConnection(_connectionString))
+            {
+                await connection.OpenAsync();
+
+                // Получаем активные алерты
+                var query = "SELECT * FROM Alerts WHERE IsActive = 1";
+                using (var cmd = new SqlCommand(query, connection))
+                using (var reader = await cmd.ExecuteReaderAsync())
+                {
+                    while (await reader.ReadAsync())
+                    {
+                        var alert = new Alert
+                        {
+                            Id = reader.GetInt32(0),
+                            UserId = reader.GetInt64(1),
+                            Currency = reader.GetString(2),
+                            Condition = reader.GetString(3),
+                            TargetValue = reader.GetDecimal(4),
+                            CreatedAt = reader.GetDateTime(5)
+                        };
+
+                        // Получаем текущий курс
+                        decimal? rate = await GetCurrencyRate(alert.Currency);
+                        if (!rate.HasValue) continue;
+
+                        // Проверяем условие
+                        bool isTriggered = false;
+                        if (alert.Condition == "<" && rate < alert.TargetValue)
+                            isTriggered = true;
+                        else if (alert.Condition == ">" && rate > alert.TargetValue)
+                            isTriggered = true;
+
+                        if (isTriggered)
+                        {
+                            // Отправляем уведомление
+                            await _botClient.SendTextMessageAsync(
+                                alert.UserId,
+                                $"🚨 АЛЕРТ! Курс {alert.Currency} достиг {rate.Value:F2} RUB\n" +
+                                $"Ваше условие: {alert.Condition} {alert.TargetValue:F2}"
+                            );
+
+                            // Деактивируем алерт
+                            using (var updateConn = new SqlConnection(_connectionString))
+                            {
+                                await updateConn.OpenAsync();
+                                var updateQuery = "UPDATE Alerts SET IsActive = 0 WHERE Id = @id";
+                                using (var updateCmd = new SqlCommand(updateQuery, updateConn))
+                                {
+                                    updateCmd.Parameters.AddWithValue("@id", alert.Id);
+                                    await updateCmd.ExecuteNonQueryAsync();
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Ошибка при проверке алертов: {ex.Message}");
+        }
+    }
+
+    // ===================== ИСТОРИЯ КУРСОВ =====================
+    private async Task SaveCurrencyRateToHistory(string currencyCode, decimal rate)
+    {
+        try
+        {
+            // Обновляем кэш
+            if (!_currencyHistory.ContainsKey(currencyCode))
+            {
+                _currencyHistory[currencyCode] = new List<CurrencyRateHistory>();
+            }
+
+            _currencyHistory[currencyCode].Add(new CurrencyRateHistory
+            {
+                Rate = rate,
+                Timestamp = DateTime.Now
+            });
+
+            // Ограничиваем размер истории
+            if (_currencyHistory[currencyCode].Count > HISTORY_LENGTH)
+            {
+                _currencyHistory[currencyCode].RemoveAt(0);
+            }
+
+            // Сохраняем в БД
+            using (var connection = new SqlConnection(_connectionString))
+            {
+                await connection.OpenAsync();
+                var query = "INSERT INTO CurrencyHistory (CurrencyCode, Rate, Timestamp) VALUES (@code, @rate, @timestamp)";
+                using (var cmd = new SqlCommand(query, connection))
+                {
+                    cmd.Parameters.AddWithValue("@code", currencyCode);
+                    cmd.Parameters.AddWithValue("@rate", rate);
+                    cmd.Parameters.AddWithValue("@timestamp", DateTime.Now);
+                    await cmd.ExecuteNonQueryAsync();
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Ошибка сохранения истории: {ex.Message}");
+        }
+    }
+
+    private async Task<decimal?> GetCurrencyRate(string currencyCode)
+    {
+        // Для рубля всегда возвращаем 1
+        if (currencyCode == "RUB")
+            return 1m;
+
+        try
+        {
+            var response = await _httpClient.GetStringAsync("https://www.cbr-xml-daily.ru/daily_json.js");
+            var data = JsonConvert.DeserializeObject<CbrResponse>(response);
+
+            // Проверяем наличие валюты в ответе
+            if (data?.Valute != null && data.Valute.TryGetValue(currencyCode.ToUpper(), out var currency))
+            {
+                // Сохраняем курс в историю
+                await SaveCurrencyRateToHistory(currencyCode, currency.Value);
+                return currency.Value;
+            }
+
+            Console.WriteLine($"Валюта {currencyCode} не найдена в ответе API");
+            return null;
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Ошибка API: {ex.Message}");
+            return null;
+        }
+    }
+
+    // ===================== ТЕКСТОВЫЙ ГРАФИК =====================
+    private string GenerateTextChart(List<CurrencyRateHistory> history)
+    {
+        if (history == null || history.Count < 2) return string.Empty;
+
+        // Нормализуем значения для отображения
+        decimal min = history.Min(h => h.Rate);
+        decimal max = history.Max(h => h.Rate);
+        decimal range = max - min;
+
+        // Для слишком маленьких диапазонов
+        if (range < 0.1m) range = 1m;
+
+        const int chartWidth = 10;
+        var chart = new StringBuilder();
+        chart.AppendLine("📈 Динамика за 24 часа:");
+
+        foreach (var point in history)
+        {
+            // Рассчитываем позицию в графике
+            int position = (int)Math.Round((point.Rate - min) / range * (chartWidth - 1));
+            // Исправление: заменяем Math.Clamp
+            position = Math.Max(0, Math.Min(position, chartWidth - 1));
+
+            // Создаем строку графика
+            chart.Append('[');
+            for (int i = 0; i < chartWidth; i++)
+            {
+                chart.Append(i == position ? '■' : ' ');
+            }
+            chart.Append($"] {point.Rate:F2} RUB\n");
+        }
+
+        return chart.ToString();
+    }
+
+    private async Task SendCurrencyRate(long chatId, string currencyCode)
+    {
+        var rate = await GetCurrencyRate(currencyCode);
+        if (!rate.HasValue)
+        {
+            await _botClient.SendTextMessageAsync(chatId, "Ошибка получения курса 😢");
+            return;
+        }
+
+        var text = new StringBuilder();
+        text.AppendLine($"💰 Курс {currencyCode}: {rate.Value:F2} RUB");
+
+        // Добавляем график если есть история
+        if (_currencyHistory.TryGetValue(currencyCode, out var history) && history.Count > 1)
+        {
+            text.Append(GenerateTextChart(history));
+        }
+
+        await _botClient.SendTextMessageAsync(chatId, text.ToString());
+    }
+
+    // ===================== КОНВЕРТЕР ВАЛЮТ =====================
+    private async Task ConvertCurrency(long chatId, string messageText)
+    {
+        try
+        {
+            // Парсим сообщение вида "100 USD to RUB"
+            var parts = messageText.Split(new[] { ' ' }, StringSplitOptions.RemoveEmptyEntries);
+            if (parts.Length < 4)
+            {
+                await _botClient.SendTextMessageAsync(chatId,
+                    "Используйте формат: [сумма] [из валюты] to [в валюту]\nПример: 100 USD to RUB");
+                return;
+            }
+
+            if (!decimal.TryParse(parts[0], NumberStyles.Any, CultureInfo.InvariantCulture, out decimal amount) || amount <= 0)
+            {
+                await _botClient.SendTextMessageAsync(chatId, "Некорректная сумма");
+                return;
+            }
+
+            string fromCurrency = parts[1].ToUpper();
+            string toCurrency = parts[3].ToUpper();
+
+            // Для рубля всегда возвращаем курс 1
+            if (fromCurrency == "RUB" && toCurrency == "RUB")
+            {
+                await _botClient.SendTextMessageAsync(chatId,
+                    $"💱 Конвертация:\n{amount} RUB = {amount:F2} RUB\nКурс: 1 RUB = 1 RUB");
+                return;
+            }
+
+            // Получаем курсы валют
+            decimal? fromRate = await GetCurrencyRate(fromCurrency);
+            decimal? toRate = await GetCurrencyRate(toCurrency);
+
+            // Если одна из валют - рубль
+            if (fromCurrency == "RUB")
+            {
+                fromRate = 1m;
+            }
+            if (toCurrency == "RUB")
+            {
+                toRate = 1m;
+            }
+
+            if (!fromRate.HasValue)
+            {
+                await _botClient.SendTextMessageAsync(chatId, $"Не удалось получить курс для валюты {fromCurrency}");
+                return;
+            }
+
+            if (!toRate.HasValue)
+            {
+                await _botClient.SendTextMessageAsync(chatId, $"Не удалось получить курс для валюты {toCurrency}");
+                return;
+            }
+
+            // Конвертируем через рубли
+            decimal result = (amount * fromRate.Value) / toRate.Value;
+
+            await _botClient.SendTextMessageAsync(chatId,
+                $"💱 Конвертация:\n" +
+                $"{amount} {fromCurrency} = {result:F2} {toCurrency}\n" +
+                $"Курс: 1 {fromCurrency} = {fromRate.Value:F2} RUB\n" +
+                $"Курс: 1 {toCurrency} = {toRate.Value:F2} RUB");
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Ошибка конвертации: {ex.Message}");
+            await _botClient.SendTextMessageAsync(chatId, "Ошибка при конвертации валюты");
+        }
+    }
+
+    // ===================== УПРАВЛЕНИЕ АЛЕРТАМИ =====================
+    private async Task StartAlertCreation(long chatId)
+    {
+        _alertStates[chatId] = AlertState.WaitingForCurrency;
+        _alertSessions[chatId] = new Alert { UserId = chatId };
+
+        var keyboard = new InlineKeyboardMarkup(new[]
+        {
+            new[] { InlineKeyboardButton.WithCallbackData("USD") },
+            new[] { InlineKeyboardButton.WithCallbackData("EUR") }
+        });
+
+        await _botClient.SendTextMessageAsync(
+            chatId,
+            "Выберите валюту для алерта:",
+            replyMarkup: keyboard
+        );
+    }
+
+    private async Task ShowUserAlerts(long chatId)
+    {
+        try
+        {
+            using (var connection = new SqlConnection(_connectionString))
+            {
+                await connection.OpenAsync();
+                var query = "SELECT * FROM Alerts WHERE UserId = @userId AND IsActive = 1";
+                using (var cmd = new SqlCommand(query, connection))
+                {
+                    cmd.Parameters.AddWithValue("@userId", chatId);
+                    using (var reader = await cmd.ExecuteReaderAsync())
+                    {
+                        var sb = new StringBuilder();
+                        sb.AppendLine("Ваши активные алерты:");
+
+                        if (!reader.HasRows)
+                        {
+                            sb.AppendLine("У вас нет активных алертов");
+                        }
+
+                        while (await reader.ReadAsync())
+                        {
+                            string currency = reader.GetString(2);
+                            string condition = reader.GetString(3);
+                            decimal targetValue = reader.GetDecimal(4);
+                            DateTime createdAt = reader.GetDateTime(5);
+
+                            sb.AppendLine($"- {currency} {condition} {targetValue:F2} (создан {createdAt:dd.MM.yyyy})");
+                        }
+
+                        await _botClient.SendTextMessageAsync(chatId, sb.ToString());
+                    }
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Ошибка при получении алертов: {ex.Message}");
+            await _botClient.SendTextMessageAsync(chatId, "❌ Ошибка при получении алертов");
+        }
+    }
+
+    public async Task HandleUpdateAsync(ITelegramBotClient botClient, Update update, CancellationToken ct)
+    {
+        try
+        {
+            if (update.Type == UpdateType.Message)
+            {
+                await HandleMessageAsync(update.Message);
+            }
+            else if (update.Type == UpdateType.CallbackQuery)
+            {
+                await HandleCallbackQueryAsync(update.CallbackQuery);
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Ошибка обработки обновления: {ex.Message}");
+        }
+    }
+
+    public Task HandlePollingErrorAsync(ITelegramBotClient botClient, Exception exception, CancellationToken ct)
+    {
+        Console.WriteLine($"Ошибка поллинга: {exception.Message}");
+        return Task.CompletedTask;
+    }
+
+    private async Task HandleMessageAsync(Message message)
+    {
+        if (message == null) return;
+
+        Console.WriteLine($"Получено сообщение: ChatId={message.Chat.Id}, Type={message.Type}, Text={message.Text}");
+
+        // Обработка контакта (для админской авторизации)
+        if (message.Contact != null)
+        {
+            await HandleContactShared(message);
+            return;
+        }
+
+        var chatId = message.Chat.Id;
+        var text = message.Text;
+
+        // Обработка ввода дат для экспорта
+        if (_adminState == AdminState.WaitingExportDates && text != null)
+        {
+            await HandleCustomDatesInput(chatId, text);
+            return;
+        }
+
+        // Обработка алертов
+        if (_alertStates.TryGetValue(chatId, out var alertState))
+        {
+            if (alertState == AlertState.WaitingForTargetValue && text != null)
+            {
+                if (decimal.TryParse(text, out decimal targetValue))
+                {
+                    var alert = _alertSessions[chatId];
+                    alert.TargetValue = targetValue;
+
+                    // Сохраняем алерт в БД
+                    using (var connection = new SqlConnection(_connectionString))
+                    {
+                        await connection.OpenAsync();
+                        var query = "INSERT INTO Alerts (UserId, Currency, Condition, TargetValue, IsActive) " +
+                                    "VALUES (@userId, @currency, @condition, @targetValue, 1)";
+                        using (var cmd = new SqlCommand(query, connection))
+                        {
+                            cmd.Parameters.AddWithValue("@userId", alert.UserId);
+                            cmd.Parameters.AddWithValue("@currency", alert.Currency);
+                            cmd.Parameters.AddWithValue("@condition", alert.Condition);
+                            cmd.Parameters.AddWithValue("@targetValue", alert.TargetValue);
+                            await cmd.ExecuteNonQueryAsync();
+                        }
+                    }
+
+                    await _botClient.SendTextMessageAsync(chatId,
+                        $"✅ Алерт установлен!\n" +
+                        $"{alert.Currency} {alert.Condition} {alert.TargetValue:F2}");
+
+                    // Сбрасываем состояние
+                    _alertStates.Remove(chatId);
+                    _alertSessions.Remove(chatId);
+                }
+                else
+                {
+                    await _botClient.SendTextMessageAsync(chatId, "Некорректное значение. Введите число:");
+                }
+                return;
+            }
+        }
+
+        if (text == null) return;
+
+        // Обработка админских команд
+        if (_authorizedAdmins.Contains(chatId))
+        {
+            if (await HandleAdminCommand(chatId, text)) return;
+        }
+
+        // Пользовательские команды
+        var command = text.Split(' ')[0].ToLower();
+
+        switch (command)
+        {
+            case "/start":
+                await SendWelcomeMessage(chatId);
+                break;
+            case "/usd":
+                await SendCurrencyRate(chatId, "USD");
+                break;
+            case "/eur":
+                await SendCurrencyRate(chatId, "EUR");
+                break;
+            case "/subscribe":
+                await ShowCurrencySelection(chatId);
+                break;
+            case "/unsubscribe":
+                await UnsubscribeUser(chatId);
+                break;
+            case "/mysettings":
+                await ShowUserSettings(chatId);
+                break;
+            case "/admin":
+                await RequestAdminContact(chatId);
+                break;
+            // Новые команды
+            case "/setalert":
+                await StartAlertCreation(chatId);
+                break;
+            case "/myalerts":
+                await ShowUserAlerts(chatId);
+                break;
+            case "/convert":
+                await ConvertCurrency(chatId, text);
+                break;
+        }
+
+        // Обработка конвертации через обычные сообщения
+        // Исправление: замена Contains на IndexOf
+        if (text.Split(' ').Length >= 4 &&
+            text.IndexOf("to", StringComparison.OrdinalIgnoreCase) >= 0 &&
+            decimal.TryParse(text.Split(' ')[0], out _))
+        {
+            await ConvertCurrency(chatId, text);
+        }
+    }
+
+    private async Task<bool> HandleAdminCommand(long chatId, string text)
+    {
+        var command = text.Split(' ')[0].ToLower();
+
+        switch (command)
+        {
+            case "/subscribers":
+                await ShowSubscribers(chatId);
+                return true;
+
+            case "/export":
+                // Начинаем сессию экспорта
+                _adminState = AdminState.WaitingExportCurrency;
+                _exportSessions[chatId] = new ExportParams();
+                await ShowCurrencySelectionForExport(chatId);
+                return true;
+
+            case "/back":
+                await ResetAdminState(chatId);
+                await ShowAdminMenu(chatId);
+                return true;
+        }
+
+        return false;
+    }
+
+    private async Task ShowCurrencySelectionForExport(long chatId)
+    {
+        var keyboard = new InlineKeyboardMarkup(new[]
+        {
+            new[]
+            {
+                InlineKeyboardButton.WithCallbackData("USD", "export_usd"),
+                InlineKeyboardButton.WithCallbackData("EUR", "export_eur")
+            },
+            new[]
+            {
+                InlineKeyboardButton.WithCallbackData("Все валюты", "export_all")
+            },
+            new[]
+            {
+                InlineKeyboardButton.WithCallbackData("Отмена", "export_cancel")
+            }
+        });
+
+        await _botClient.SendTextMessageAsync(
+            chatId,
+            "Выберите валюту для экспорта:",
+            replyMarkup: keyboard
+        );
+    }
+
+    private async Task HandleCallbackQueryAsync(CallbackQuery callbackQuery)
+    {
+        var data = callbackQuery.Data;
+        var chatId = callbackQuery.From.Id;
+
+        // Обработка подписки пользователя
+        if (data == "USD" || data == "EUR")
+        {
+            try
+            {
+                using (var connection = new SqlConnection(_connectionString))
+                {
+                    await connection.OpenAsync();
+
+                    // Проверяем существующую подписку
+                    var checkQuery = "SELECT COUNT(*) FROM Subscribers WHERE TelegramUserId = @userId";
+                    using (var checkCmd = new SqlCommand(checkQuery, connection))
+                    {
+                        checkCmd.Parameters.AddWithValue("@userId", chatId);
+                        int exists = (int)await checkCmd.ExecuteScalarAsync();
+
+                        if (exists > 0)
+                        {
+                            // Обновляем существующую подписку
+                            var updateQuery = "UPDATE Subscribers SET CurrencySub = @currency WHERE TelegramUserId = @userId";
+                            using (var updateCmd = new SqlCommand(updateQuery, connection))
+                            {
+                                updateCmd.Parameters.AddWithValue("@currency", data);
+                                updateCmd.Parameters.AddWithValue("@userId", chatId);
+                                await updateCmd.ExecuteNonQueryAsync();
+                            }
+                        }
+                        else
+                        {
+                            // Добавляем новую подписку
+                            var name = $"{callbackQuery.From.FirstName} {callbackQuery.From.LastName}";
+                            var insertQuery = "INSERT INTO Subscribers (Name, CurrencySub, TelegramUserId) VALUES (@name, @currency, @userId)";
+                            using (var insertCmd = new SqlCommand(insertQuery, connection))
+                            {
+                                insertCmd.Parameters.AddWithValue("@name", name);
+                                insertCmd.Parameters.AddWithValue("@currency", data);
+                                insertCmd.Parameters.AddWithValue("@userId", chatId);
+                                await insertCmd.ExecuteNonQueryAsync();
+                            }
+                        }
+                    }
+                }
+
+                await _botClient.AnswerCallbackQueryAsync(callbackQuery.Id, "✅ Подписка оформлена!");
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Ошибка при подписке: {ex.Message}");
+                await _botClient.AnswerCallbackQueryAsync(callbackQuery.Id, "❌ Ошибка при оформлении подписки");
+            }
+        }
+        // Обработка экспорта
+        else if (data.StartsWith("export_"))
+        {
+            await HandleExportCallback(callbackQuery);
+        }
+        // Обработка выбора валюты для алерта
+        else if (_alertStates.TryGetValue(chatId, out var alertState) &&
+                alertState == AlertState.WaitingForCurrency &&
+                (data == "USD" || data == "EUR"))
+        {
+            _alertSessions[chatId].Currency = data;
+            _alertStates[chatId] = AlertState.WaitingForCondition;
+
+            var keyboard = new InlineKeyboardMarkup(new[]
+            {
+                new[] { InlineKeyboardButton.WithCallbackData("Курс ниже", "<") },
+                new[] { InlineKeyboardButton.WithCallbackData("Курс выше", ">") }
+            });
+
+            await _botClient.EditMessageTextAsync(
+                chatId,
+                callbackQuery.Message.MessageId,
+                "Выберите условие:",
+                replyMarkup: keyboard
+            );
+        }
+        // Обработка выбора условия для алерта
+        else if (alertState == AlertState.WaitingForCondition &&
+                (data == "<" || data == ">"))
+        {
+            _alertSessions[chatId].Condition = data;
+            _alertStates[chatId] = AlertState.WaitingForTargetValue;
+
+            await _botClient.EditMessageTextAsync(
+                chatId,
+                callbackQuery.Message.MessageId,
+                "Введите целевое значение:"
+            );
+        }
+    }
+
+    private async Task HandleExportCallback(CallbackQuery callbackQuery)
+    {
+        var chatId = callbackQuery.Message.Chat.Id;
+        var data = callbackQuery.Data;
+
+        if (!_exportSessions.TryGetValue(chatId, out var exportParams))
+        {
+            await _botClient.AnswerCallbackQueryAsync(callbackQuery.Id, "Сессия истекла, начните заново");
+            return;
+        }
+
+        try
+        {
+            switch (data)
+            {
+                case "export_usd":
+                    exportParams.Currency = "USD";
+                    break;
+
+                case "export_eur":
+                    exportParams.Currency = "EUR";
+                    break;
+
+                case "export_all":
+                    exportParams.Currency = null;
+                    break;
+
+                case "export_today":
+                    exportParams.StartDate = DateTime.Today;
+                    exportParams.EndDate = DateTime.Today.AddDays(1);
+                    await ExportSubscriptions(chatId, exportParams);
+                    await ResetAdminState(chatId);
+                    return;
+
+                case "export_week":
+                    exportParams.StartDate = DateTime.Today.AddDays(-7);
+                    exportParams.EndDate = DateTime.Today.AddDays(1);
+                    await ExportSubscriptions(chatId, exportParams);
+                    await ResetAdminState(chatId);
+                    return;
+
+                case "export_month":
+                    exportParams.StartDate = DateTime.Today.AddMonths(-1);
+                    exportParams.EndDate = DateTime.Today.AddDays(1);
+                    await ExportSubscriptions(chatId, exportParams);
+                    await ResetAdminState(chatId);
+                    return;
+
+                case "export_all_time":
+                    exportParams.StartDate = null;
+                    exportParams.EndDate = null;
+                    await ExportSubscriptions(chatId, exportParams);
+                    await ResetAdminState(chatId);
+                    return;
+
+                case "export_custom":
+                    _adminState = AdminState.WaitingExportDates;
+                    await _botClient.EditMessageTextAsync(
+                        chatId,
+                        callbackQuery.Message.MessageId,
+                        "Введите даты в формате:\nГГГГ-ММ-ДД ГГГГ-ММ-ДД\nПример: 2023-01-01 2023-12-31"
+                    );
+                    return;
+
+                case "export_cancel":
+                    await ResetAdminState(chatId);
+                    await _botClient.EditMessageTextAsync(
+                        chatId,
+                        callbackQuery.Message.MessageId,
+                        "Экспорт отменен"
+                    );
+                    return;
+            }
+
+            // После выбора валюты переходим к выбору дат
+            _adminState = AdminState.WaitingExportPeriod;
+            await _botClient.EditMessageTextAsync(
+                chatId,
+                callbackQuery.Message.MessageId,
+                "Выберите период:",
+                replyMarkup: GetDateOptionsKeyboard()
+            );
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Ошибка обработки экспорта: {ex.Message}");
+            await _botClient.AnswerCallbackQueryAsync(callbackQuery.Id, "❌ Ошибка при обработке запроса");
+        }
+    }
+
+    private InlineKeyboardMarkup GetDateOptionsKeyboard()
+    {
+        return new InlineKeyboardMarkup(new[]
+        {
+            new[]
+            {
+                InlineKeyboardButton.WithCallbackData("Сегодня", "export_today"),
+                InlineKeyboardButton.WithCallbackData("За неделю", "export_week")
+            },
+            new[]
+            {
+                InlineKeyboardButton.WithCallbackData("За месяц", "export_month"),
+                InlineKeyboardButton.WithCallbackData("За все время", "export_all_time")
+            },
+            new[]
+            {
+                InlineKeyboardButton.WithCallbackData("Ввести даты", "export_custom"),
+                InlineKeyboardButton.WithCallbackData("Отмена", "export_cancel")
+            }
+        });
+    }
+
+    private async Task ResetAdminState(long chatId)
+    {
+        _adminState = AdminState.None;
+        _exportSessions.Remove(chatId);
+    }
+
+    private async Task HandleCustomDatesInput(long chatId, string text)
+    {
+        if (!_exportSessions.TryGetValue(chatId, out var exportParams))
+        {
+            await _botClient.SendTextMessageAsync(chatId, "Сессия истекла, начните заново");
+            return;
+        }
+
+        try
+        {
+            var dates = text.Split(' ');
+            if (dates.Length != 2)
+            {
+                await _botClient.SendTextMessageAsync(chatId, "Неверный формат. Введите две даты через пробел");
+                return;
+            }
+
+            if (DateTime.TryParse(dates[0], out DateTime startDate) &&
+                DateTime.TryParse(dates[1], out DateTime endDate))
+            {
+                exportParams.StartDate = startDate;
+                exportParams.EndDate = endDate.AddDays(1); // Чтобы включить весь указанный день
+                await ExportSubscriptions(chatId, exportParams);
+                await ResetAdminState(chatId);
+            }
+            else
+            {
+                await _botClient.SendTextMessageAsync(chatId, "Неверный формат дат. Попробуйте снова");
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Ошибка обработки дат: {ex.Message}");
+            await _botClient.SendTextMessageAsync(chatId, "❌ Ошибка при обработке дат");
+        }
+    }
+
+    private async Task SendWelcomeMessage(long chatId)
+    {
+        const string text = "Добро пожаловать! 🤑\n\n" +
+                            "Доступные команды:\n" +
+                            "/usd - курс доллара\n" +
+                            "/eur - курс евро\n" +
+                            "/subscribe - подписаться на рассылку\n" +
+                            "/unsubscribe - отписаться\n" +
+                            "/mysettings - мои настройки\n" +
+                            "/admin - панель администратора\n" +
+                            "/setalert - установить алерт\n" +
+                            "/myalerts - мои алерты\n" +
+                            "/convert - конвертер валют";
+
+        await _botClient.SendTextMessageAsync(chatId, text);
+    }
+
+    private async Task ShowCurrencySelection(long chatId)
+    {
+        var keyboard = new InlineKeyboardMarkup(new[]
+        {
+            new[] { InlineKeyboardButton.WithCallbackData("USD") },
+            new[] { InlineKeyboardButton.WithCallbackData("EUR") }
+        });
+
+        await _botClient.SendTextMessageAsync(chatId, "Выберите валюту для подписки:", replyMarkup: keyboard);
+    }
+
+    private async Task ShowUserSettings(long chatId)
+    {
+        try
+        {
+            using (var connection = new SqlConnection(_connectionString))
+            {
+                await connection.OpenAsync();
+                var query = "SELECT CurrencySub FROM Subscribers WHERE TelegramUserId = @userId";
+                using (var cmd = new SqlCommand(query, connection))
+                {
+                    cmd.Parameters.AddWithValue("@userId", chatId);
+                    using (var reader = await cmd.ExecuteReaderAsync())
+                    {
+                        if (await reader.ReadAsync())
+                        {
+                            var currency = reader.GetString(0);
+                            await _botClient.SendTextMessageAsync(chatId, $"Ваша подписка: {currency}");
+                        }
+                        else
+                        {
+                            await _botClient.SendTextMessageAsync(chatId, "У вас нет активных подписок");
+                        }
+                    }
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Ошибка при получении настроек: {ex.Message}");
+            await _botClient.SendTextMessageAsync(chatId, "❌ Ошибка при получении настроек");
+        }
+    }
+
+    private async Task UnsubscribeUser(long chatId)
+    {
+        try
+        {
+            using (var connection = new SqlConnection(_connectionString))
+            {
+                await connection.OpenAsync();
+                var query = "DELETE FROM Subscribers WHERE TelegramUserId = @userId";
+                using (var cmd = new SqlCommand(query, connection))
+                {
+                    cmd.Parameters.AddWithValue("@userId", chatId);
+                    int rowsAffected = await cmd.ExecuteNonQueryAsync();
+
+                    if (rowsAffected > 0)
+                    {
+                        await _botClient.SendTextMessageAsync(chatId, "❌ Подписка отменена");
+                    }
+                    else
+                    {
+                        await _botClient.SendTextMessageAsync(chatId, "У вас нет активных подписок");
+                    }
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Ошибка при отписке: {ex.Message}");
+            await _botClient.SendTextMessageAsync(chatId, "❌ Ошибка при отписке");
+        }
+    }
+
+    // ===================== АДМИНСКАЯ ЧАСТЬ =====================
+    private async Task RequestAdminContact(long chatId)
+    {
+        var requestContactButton = new KeyboardButton("Отправить контакт") { RequestContact = true };
+        var replyMarkup = new ReplyKeyboardMarkup(new[] { new[] { requestContactButton } })
+        {
+            ResizeKeyboard = true,
+            OneTimeKeyboard = true
+        };
+
+        await _botClient.SendTextMessageAsync(
+            chatId,
+            "Для авторизации поделитесь контактом:",
+            replyMarkup: replyMarkup
+        );
+    }
+
+    private string NormalizePhoneNumber(string phone)
+    {
+        if (string.IsNullOrWhiteSpace(phone))
+            return phone;
+
+        // Удаляем все нецифровые символы
+        string digits = new string(phone.Where(char.IsDigit).ToArray());
+
+        // Обработка российских номеров
+        if (digits.Length == 11 && digits.StartsWith("7"))
+            return "+" + digits;
+
+        if (digits.Length == 11 && digits.StartsWith("8"))
+            return "+7" + digits.Substring(1);
+
+        return "+" + digits;
+    }
+    public async Task HandleContactShared(Message message)
+    {
+        if (message.Contact == null) return;
+
+        var chatId = message.Chat.Id;
+        var phone = NormalizePhoneNumber(message.Contact.PhoneNumber);
+
+        Console.WriteLine($"Нормализованный контакт: {phone}");
+
+        try
+        {
+            using (var connection = new SqlConnection(_connectionString))
+            {
+                await connection.OpenAsync();
+
+                // Проверка конкретного номера
+                var checkQuery = "SELECT COUNT(*) FROM Admins WHERE PhoneNumber = @phone";
+                using (var checkCmd = new SqlCommand(checkQuery, connection))
+                {
+                    checkCmd.Parameters.AddWithValue("@phone", phone);
+                    int adminCount = (int)await checkCmd.ExecuteScalarAsync();
+
+                    Console.WriteLine($"Найдено администраторов с номером {phone}: {adminCount}");
+
+                    if (adminCount > 0)
+                    {
+                        _authorizedAdmins.Add(chatId);
+                        await _botClient.SendTextMessageAsync(
+                            chatId,
+                            "✅ Вы авторизованы как администратор!",
+                            replyMarkup: new ReplyKeyboardRemove()
+                        );
+                        await ShowAdminMenu(chatId);
+                    }
+                    else
+                    {
+                        await _botClient.SendTextMessageAsync(
+                            chatId,
+                            "⛔ Доступ запрещен. Ваш номер не найден в списке администраторов",
+                            replyMarkup: new ReplyKeyboardRemove()
+                        );
+                    }
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Ошибка при авторизации админа: {ex}");
+            await _botClient.SendTextMessageAsync(
+                chatId,
+                "❌ Ошибка при проверке авторизации",
+                replyMarkup: new ReplyKeyboardRemove()
+            );
+        }
+    }
+    private async Task ShowAdminMenu(long chatId)
+    {
+        var keyboard = new ReplyKeyboardMarkup(new[]
+        {
+            new[] { new KeyboardButton("/subscribers") },
+            new[] { new KeyboardButton("/export") },
+            new[] { new KeyboardButton("/back") }
+        })
+        {
+            ResizeKeyboard = true
+        };
+
+        await _botClient.SendTextMessageAsync(
+            chatId,
+            "Админ-панель:\n" +
+            "/subscribers - список подписчиков\n" +
+            "/export - экспорт данных\n" +
+            "/back - назад",
+            replyMarkup: keyboard
+        );
+    }
+
+    private async Task ShowSubscribers(long chatId)
+    {
+        try
+        {
+            var sb = new StringBuilder();
+            sb.AppendLine("Список подписчиков:");
+            sb.AppendLine("------------------");
+
+            using (var connection = new SqlConnection(_connectionString))
+            {
+                await connection.OpenAsync();
+                var query = "SELECT Name, CurrencySub, SubscriptionDate FROM Subscribers";
+                using (var cmd = new SqlCommand(query, connection))
+                using (var reader = await cmd.ExecuteReaderAsync())
+                {
+                    while (await reader.ReadAsync())
+                    {
+                        string name = reader.GetString(0);
+                        string currency = reader.GetString(1);
+                        DateTime subDate = reader.GetDateTime(2);
+
+                        sb.AppendLine($"👤 Имя: {name}");
+                        sb.AppendLine($"💱 Валюта: {currency}");
+                        sb.AppendLine($"📅 Дата подписки: {subDate:dd.MM.yyyy}");
+                        sb.AppendLine();
+                    }
+                }
+            }
+
+            if (sb.Length > 0)
+            {
+                await _botClient.SendTextMessageAsync(chatId, sb.ToString());
+            }
+            else
+            {
+                await _botClient.SendTextMessageAsync(chatId, "Нет активных подписчиков");
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Ошибка при получении подписчиков: {ex.Message}");
+            await _botClient.SendTextMessageAsync(chatId, "❌ Ошибка при получении списка подписчиков");
+        }
+    }
+
+    private async Task ExportSubscriptions(long chatId, ExportParams exportParams)
+    {
+        try
+        {
+            var sb = new StringBuilder();
+            sb.AppendLine("UserID;Name;Currency;SubscriptionDate");
+
+            using (var connection = new SqlConnection(_connectionString))
+            {
+                await connection.OpenAsync();
+                var query = new StringBuilder("SELECT Id, Name, CurrencySub, SubscriptionDate FROM Subscribers WHERE 1=1");
+
+                // Фильтр по валюте
+                if (!string.IsNullOrEmpty(exportParams.Currency))
+                {
+                    query.Append(" AND CurrencySub = @currency");
+                }
+
+                // Фильтр по датам
+                if (exportParams.StartDate.HasValue && exportParams.EndDate.HasValue)
+                {
+                    query.Append(" AND SubscriptionDate BETWEEN @startDate AND @endDate");
+                }
+
+                using (var cmd = new SqlCommand(query.ToString(), connection))
+                {
+                    if (!string.IsNullOrEmpty(exportParams.Currency))
+                    {
+                        cmd.Parameters.AddWithValue("@currency", exportParams.Currency);
+                    }
+
+                    if (exportParams.StartDate.HasValue && exportParams.EndDate.HasValue)
+                    {
+                        cmd.Parameters.AddWithValue("@startDate", exportParams.StartDate);
+                        cmd.Parameters.AddWithValue("@endDate", exportParams.EndDate);
+                    }
+
+                    using (var reader = await cmd.ExecuteReaderAsync())
+                    {
+                        while (await reader.ReadAsync())
+                        {
+                            int id = reader.GetInt32(0);
+                            string name = reader.GetString(1);
+                            string currency = reader.GetString(2);
+                            DateTime subDate = reader.GetDateTime(3);
+
+                            sb.AppendLine($"{id};{name};{currency};{subDate:yyyy-MM-dd}");
+                        }
+                    }
+                }
+            }
+
+            if (sb.Length > 30)
+            {
+                // Сохранение во временный файл
+                var tempFile = Path.GetTempFileName() + ".csv";
+                System.IO.File.WriteAllText(tempFile, sb.ToString(), Encoding.UTF8);
+
+                // Отправка файла
+                using (var stream = System.IO.File.OpenRead(tempFile))
+                {
+                    await _botClient.SendDocumentAsync(
+                        chatId,
+                        new Telegram.Bot.Types.InputFiles.InputOnlineFile(stream, "subscriptions.csv"),
+                        "Экспорт подписок"
+                    );
+                }
+
+                System.IO.File.Delete(tempFile);
+            }
+            else
+            {
+                await _botClient.SendTextMessageAsync(chatId, "Нет данных для экспорта");
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Ошибка при экспорте: {ex.Message}");
+            await _botClient.SendTextMessageAsync(chatId, "❌ Ошибка при экспорте данных");
+        }
+    }
+}
+
+public class ExportParams
+{
+    public string Currency { get; set; }
+    public DateTime? StartDate { get; set; }
+    public DateTime? EndDate { get; set; }
+}
+
+public enum AdminState
+{
+    None,
+    WaitingExportCurrency,
+    WaitingExportPeriod,
+    WaitingExportDates
+}
+
+public class CbrResponse
+{
+    public Dictionary<string, CurrencyInfo> Valute { get; set; }
+}
+
+public class CurrencyInfo
+{
+    public decimal Value { get; set; }
+}
+
+
+public class Alert
+{
+    public int Id { get; set; }
+    public long UserId { get; set; }
+    public string Currency { get; set; } // "USD", "EUR"
+    public string Condition { get; set; } // "<", ">"
+    public decimal TargetValue { get; set; }
+    public bool IsActive { get; set; } = true;
+    public DateTime CreatedAt { get; set; } = DateTime.Now;
+}
+
+public class CurrencyRateHistory
+{
+    public decimal Rate { get; set; }
+    public DateTime Timestamp { get; set; }
+}
+
+public class Program
+{
+    public static async Task Main()
+    {
+        Console.WriteLine("Запуск бота...");
+
+        // Получаем параметры из переменных окружения
+        string botToken = Environment.GetEnvironmentVariable("BOT_TOKEN") ?? "7161824860:AAHXWqRszRhT5Z4Ti5Eu2vuGC40XLAsQ1mI";
+        string connectionString = Environment.GetEnvironmentVariable("DB_CONNECTION") ?? "Server=DESKTOP-2A9H5QL;Database=Telegramm Test Task;Integrated Security=True;";
+
+        // Инициализация базы данных
+       
+
+        var bot = new CurrencyBot(botToken, connectionString);
+        await bot.RunBotAsync();
+    }
+
+ 
+    }
