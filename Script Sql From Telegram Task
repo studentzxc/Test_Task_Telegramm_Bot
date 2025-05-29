@@ -1,0 +1,51 @@
+-- Создание таблицы Админы (расширенная)
+CREATE TABLE Admins (
+    Id INT PRIMARY KEY IDENTITY(1,1),
+    PhoneNumber NVARCHAR(20) ,
+    CreatedAt DATETIME NOT NULL DEFAULT GETDATE(),
+    IsActive BIT NOT NULL DEFAULT 1
+);
+
+-- Создание таблицы Подписчики (расширенная)
+CREATE TABLE Subscribers (
+    Id INT PRIMARY KEY IDENTITY(1,1),
+    Name NVARCHAR(100) NOT NULL,
+    CurrencySub NVARCHAR(3) NOT NULL,
+    SubscriptionDate DATETIME NOT NULL DEFAULT GETDATE(),
+    TelegramUserId BIGINT NULL UNIQUE,
+    IsActive BIT NOT NULL DEFAULT 1
+);
+CREATE TABLE Alerts (
+    Id INT IDENTITY(1,1) PRIMARY KEY,
+    UserId BIGINT NOT NULL,
+    Currency NVARCHAR(3) NOT NULL,
+    Condition NVARCHAR(2) NOT NULL,
+    TargetValue DECIMAL(18,4) NOT NULL,
+    IsActive BIT NOT NULL DEFAULT 1,
+    CreatedAt DATETIME NOT NULL DEFAULT GETDATE()
+);
+
+-- Таблица истории курсов
+CREATE TABLE CurrencyHistory (
+    Id INT IDENTITY(1,1) PRIMARY KEY,
+    CurrencyCode NVARCHAR(3) NOT NULL,
+    Rate DECIMAL(18,4) NOT NULL,
+    Timestamp DATETIME NOT NULL DEFAULT GETDATE()
+);
+-- Создание индексов
+CREATE INDEX IX_Admins_PhoneNumber ON Admins (PhoneNumber);
+CREATE INDEX IX_Subscribers_CurrencySub ON Subscribers (CurrencySub);
+CREATE INDEX IX_Subscribers_TelegramUserId ON Subscribers (TelegramUserId);
+-- Добавление администраторов
+INSERT INTO Admins (PhoneNumber)
+VALUES 
+    ('+79123456789'),
+    ('+79098765432');
+
+-- Добавление подписчиков
+INSERT INTO Subscribers (Name, CurrencySub)
+VALUES 
+    ('Иван Петров', 'USD'),
+    ('Мария Сидорова', 'EUR'),
+    ('Алексей Иванов', 'USD');
+	
